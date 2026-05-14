@@ -18,6 +18,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install dependencies
+        run: pip install PyYAML
+
       - name: Sync docs to wiki
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
