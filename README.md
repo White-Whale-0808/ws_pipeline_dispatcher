@@ -1,45 +1,169 @@
 # ws_pipeline_dispatcher
 
-C 子系統，負責把 Fastify 上層（`edge-ws-host`）落地的 chunk 檔案
-經由 `stream_merge → log_parse → clip_store` 三段 UNIX pipeline 處理，
-最終寫入 `clips.db`。
+`ws_pipeline_dispatcher` 是一組以 C 實作的 UNIX pipeline applets，對應 UNIX 系統程式設計期末專題選項 B「BusyBox 工具擴充」中的方向三「Embedded Data Pipeline」。
 
-詳細規格見 [`.docs/full_spec.md`](.docs/full_spec.md) 及各模組文件。
+本 repo 的主軸不是 WebSocket server，而是把上層落地的 append-only stream 轉成可被 UNIX pipe 組合、過濾、儲存的資料處理管線。
 
-## 編譯
+## 專案主軸
+
+系統分成兩層：
+
+- `edge-ws-host`：接收 ESP32 WebSocket packet，將 payload append 到 stream 檔案，並啟動 C pipeline。
+- `ws_pipeline_dispatcher`：讀取 growing file stream，切出 structured records，過濾 clip event，寫入 file-backed index。
+
+核心設計是把複雜串流處理拆成三個小工具：
+
+```text
+stream_merge | log_parse --filter type=clip | clip_store
+```
+
+每個 applet 只做一件事，stdout 只傳資料，stderr 只寫診斷訊息。這讓整體行為符合 UNIX pipeline 的組合方式，也能在資源受限環境中以小型 C binary 運作。
+
+## 作業方向對應
+
+| 作業 B + 方向三要求 | 本 repo 對應 |
+| --- | --- |
+| 使用 C 語言實作 3 個新的 applet | `stream_merge`、`log_parse`、`clip_store` |
+| 結構化日誌解析器 | `log_parse --regex ... --fields ... --format json\|csv` |
+| 串流資料過濾與轉換工具 | `stream_merge` 讀取 growing file，`log_parse --filter key=value` 過濾 records |
+| 輕量級資料儲存引擎 | `clip_store` 寫入 file-backed key-value index，支援 TTL、查詢與 GC |
+| 三個工具可透過 UNIX pipe 組成完整管線 | `pipeline_dispatcher` 建立 `stream_merge -> log_parse -> clip_store` |
+| 提取共用邏輯為內部函式庫 | `libpipeline`、`stream_logger` |
+| 遵循 stdout/stderr 與 CLI 慣例 | applet stdout 保持資料流，diagnostic logs 走 stderr |
+
+完整 compliance matrix 會在 v2.0 文件對齊階段補上。
+
+## Pipeline 架構
+
+```text
+ESP32 Video Data
+  -> edge-ws-host
+  -> /tmp/stream/{session_id}/{session_id}.bin
+  -> pipeline_dispatcher
+       stream_merge stdout -> log_parse stdout -> clip_store
+  -> /tmp/clips.db
+```
+
+`pipeline_dispatcher` 是 C entry point，負責建立 process pipeline：
+
+- 用 `pipe()` 建立 applet 間的資料通道。
+- 用 `fork()` 建立 child processes。
+- 用 `execv()` 執行三個 applet。
+- 用 `waitpid()` 回收 child 狀態並回報整體 exit code。
+
+跨 repo 的啟動時機、檔案 layout 與 packet contract 以 Linear integration docs 為準；repo 內部實作細節則記錄在 `.docs/`。
+
+## Applets
+
+### `pipeline_dispatcher`
+
+建立三段 UNIX pipeline，不直接處理 clip JSON：
+
+```text
+pipeline_dispatcher <session_id> <src_dir> <db_path> <ttl_seconds>
+```
+
+### `stream_merge`
+
+讀取 `{src_dir}/{session_id}.bin` append-only growing file，透過 `inotify` 與 `poll` 觀察檔案更新，看到 `.pipeline_end` 後 drain 剩餘內容並輸出完整 clip JSON Lines。
+
+### `log_parse`
+
+stdin -> stdout 的 structured record processor，支援兩種用途：
+
+- 基本需求：regex-based parsing、輸出 JSON 或 CSV。
+- Filter 功能：讀取 JSON Lines，使用 `--filter key=value` 保留指定 records。
+
+### `clip_store`
+
+pipeline 終端的 file-backed index。從 stdin 讀取 clip JSON Lines，用 `session_id:ts` 作為 key，clip path 作為 value，寫入純文字 DB，並提供查詢、TTL 與 GC 行為。
+
+## 系統程式設計重點
+
+本 repo 的技術重點集中在 UNIX 系統程式設計，而不是 Web framework：
+
+- Process management：`fork()`、`execv()`、`waitpid()`。
+- IPC：`pipe()`、stdin/stdout chaining。
+- Filesystem streaming：append-only file、sentinel file、tail-read offset。
+- Event notification：`inotify`、`poll()`。
+- File-backed storage：`open()`、`flock()`、append-only index、GC rewrite 方向。
+- Error handling：exit code propagation、child process failure handling。
+- Stream discipline：stdout 只放 structured data，stderr 只放 diagnostic logs。
+
+## 編譯與測試
 
 ```bash
-make           # 編譯所有 binary 到 build/
-make test      # 執行 libpipeline 單元測試
-make smoke     # end-to-end 骨架煙霧測試
-make clean
+make           # 編譯所有 applet 到 build/
+make test      # 執行 C unit tests 與 applet shell tests
+make smoke     # 執行 end-to-end smoke test
+make clean     # 移除 build artifacts
 ```
+
+目前測試涵蓋：
+
+- `libpipeline` inotify、buffer、sentinel helpers。
+- `stream_logger` stderr-only logging。
+- `log_parse` regex parsing、JSON/CSV output、filter 行為。
+- `stream_merge` growing file drain 與 sentinel 行為。
+- `clip_store` append/get/TTL/GC/concurrent writes。
+- `pipeline_dispatcher` process orchestration 與 end-to-end DB 寫入。
+
+## 快速 Demo
+
+最小 end-to-end 使用方式：
+
+```bash
+make
+rm -rf /tmp/stream/demo /tmp/clips.db
+mkdir -p /tmp/stream/demo
+: > /tmp/stream/demo/demo.bin
+./build/pipeline_dispatcher demo /tmp/stream/demo /tmp/clips.db 300 &
+pid=$!
+printf '%s' '{"type":"clip","session_id":"demo","ts":1,"path":"/tmp/demo.mp4"}' >> /tmp/stream/demo/demo.bin
+touch /tmp/stream/demo/.pipeline_end
+wait "$pid"
+cat /tmp/clips.db
+```
+
+完整 demo 會在 v2.2 的 benchmark/demo evidence 中補成可重跑腳本，涵蓋多筆 stream、malformed input、TTL/GC 與 failure behavior。
 
 ## 目錄結構
 
-```
+```text
 .
-├── applets/
-│   ├── pipeline_dispatcher.c   ← C entry point (fork + pipe + exec)
-│   ├── stream_merge.c          ← v1 skeleton stub
-│   ├── log_parse.c             ← v1 skeleton stub
-│   └── clip_store.c            ← v1 skeleton stub
-├── lib/
-│   ├── libpipeline.{h,c}       ← 共用基礎函式（inotify、time、JSON 壓縮、sentinel）
-│   └── stream_logger.{h,c}     ← stderr-only LOG_* 巨集
-├── tests/
-│   └── test_libpipeline.c
-├── .docs/                      ← 規格與設計文件
-└── Makefile
+|-- applets/
+|   |-- pipeline_dispatcher.c   # fork + pipe + exec orchestration
+|   |-- stream_merge.c          # growing file reader and JSONL framing
+|   |-- log_parse.c             # regex parser, JSON/CSV formatter, record filter
+|   `-- clip_store.c            # file-backed clip index
+|-- lib/
+|   |-- libpipeline.{h,c}       # inotify, monotonic time, buffer, sentinel helpers
+|   `-- stream_logger.{h,c}     # stderr-only diagnostic logger
+|-- tests/                      # C unit tests and shell integration tests
+|-- .docs/                      # repo-local implementation and design docs
+`-- Makefile
 ```
 
-## v1 範圍
+## 目前狀態
 
-本 PR 提供**最小可編譯骨架**：
+v1 已完成 repo-local pipeline baseline：
 
-- `pipeline_dispatcher` 真的會 `pipe()` + `fork()` + `exec()` 把三個 applet 串成 pipeline。
-- 三個 applet 為 stub：`stream_merge` 送一條 heartbeat、`log_parse` pass-through、
-  `clip_store` append-only 寫檔。
-- `libpipeline` 與 `stream_logger` 為 v1 完整實作（小但可用）。
+- `pipeline_dispatcher` 可建立 `stream_merge -> log_parse -> clip_store` process pipeline。
+- `stream_merge` 可讀取 append-only stream、觀察 sentinel、輸出 clip JSON Lines。
+- `log_parse` 可做 regex parsing、JSON/CSV output 與 JSONL filter。
+- `clip_store` 可寫入 file-backed index，並支援查詢、TTL、GC。
+- `libpipeline` 與 `stream_logger` 提供 applet 共用低階 helper。
 
-真實的 ingest／filter／store 邏輯將在後續 PR 取代各 applet 的 `main()`。
+v2 會優先補齊作業交付需要的文件、收斂與證據：
+
+- v2.0：文件主軸對齊，補 README、compliance matrix、repo docs 與開源文件骨架。
+- v2.1：Pipeline 核心收斂，修正 contract mismatch 並抽出必要共用邏輯。
+- v2.2：Benchmark 與 Demo 證據，補可重跑 benchmark、compatibility matrix 與 final demo script。
+
+## 文件
+
+- Repo-local implementation docs：[`./.docs/Home.md`](.docs/Home.md)
+- Internal spec：[`./.docs/full_spec.md`](.docs/full_spec.md)
+- Cross-repo integration contract：Linear integration docs
+
+若 Linear integration docs 與 repo-local docs 衝突，以 Linear 作為跨 repo contract 的 source of truth；repo `.docs/` 則描述本 repo 的實作細節、測試與設計限制。
