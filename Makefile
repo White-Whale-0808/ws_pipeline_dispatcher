@@ -51,7 +51,7 @@ $(BUILD_DIR)/test_stream_logger: tests/test_stream_logger.c $(LIB_OBJS) | $(BUIL
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB_OBJS) $(LDFLAGS) $(LDLIBS) -o $@
 
 test: $(TEST_BINS)
-	@for test_bin in $(TEST_BINS); do $$test_bin; done
+	@for test_bin in $(TEST_BINS); do $$test_bin || exit $$?; done
 
 # End-to-end smoke: run dispatcher with skeleton stubs from build/.
 smoke: all
